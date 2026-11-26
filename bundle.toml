@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# What the builder puts in a bundle. See docs/DESIGN.md.
+
+[sources]
+# The organisation whose default-branch .pre-commit-config.yaml files
+# are surveyed for hook environments.
+org = "lfreleng-actions"
+# A hook environment is built when this many repositories use it.
+min_repos = 2
+# Repositories whose every hook environment is built whatever the
+# count: the canonical configuration other repositories copy.
+always = ["actions-template"]
+
+[platform]
+# Where a lint job's prek keeps its store. Hook environments embed
+# absolute paths, so a bundle serves this one location and the
+# installer refuses any other.
+prek_home = "/home/runner/.cache/prek"
+# The runner image family the bundle is built for: the ImageOS value
+# GitHub sets on its hosted runners. The sandbox image in
+# sandbox/Dockerfile must be the matching distribution release.
+image_os = "ubuntu24"
+
+[toolchains]
+# Versions prek is asked for when the trusted base stage seeds the
+# store. Every hook environment is then built against these, never
+# against a toolchain the runner image happens to carry. An empty
+# value takes prek's default, the newest release.
+python = "3.13"
+node = "lts"
+golang = ""

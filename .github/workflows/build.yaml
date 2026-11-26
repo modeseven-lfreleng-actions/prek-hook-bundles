@@ -1,0 +1,352 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# Builds the bundle of prek hook environments, then proves it on fresh
+# runners: one lints this repository with an empty prek store, one with
+# the bundle installed, and the two must report the same result for
+# every hook while the second builds no environment at all.
+#
+# See docs/DESIGN.md. This workflow does not publish anything yet: the
+# bundle is a run artifact, which is all the verification needs.
+name: 'Build hook bundle 📦'
+
+# yamllint disable-line rule:truthy
+on:
+  workflow_dispatch:
+  push:
+    branches: ['main']
+  pull_request:
+    branches: ['main']
+
+concurrency:
+  group: 'build-${{ github.ref }}'
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  test:
+    name: 'Unit tests'
+    runs-on: 'ubuntu-24.04'
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@65ff87957e1cac2de3203a85dbb07c31810321cb  # v0.16.4
+        with:
+          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22'  # v0.17.1
+
+      - name: 'Harden runner (block)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c  # v2.23.0
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Install uv'
+        # yamllint disable-line rule:line-length
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          version: '0.13.4'
+          enable-cache: false
+
+      - name: 'Run the unit tests'
+        shell: bash
+        run: |
+          # Run the unit tests
+          set -euo pipefail
+          uv run --locked python -m unittest discover -s tests -t .
+
+  build:
+    name: 'Build bundle'
+    runs-on: 'ubuntu-24.04'
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      # Audit, not block: the sandbox installs whatever the planned
+      # hooks' packaging asks for, from registries no list can name in
+      # advance. Each install runs in a container that holds nothing
+      # worth sending anywhere; see docs/DESIGN.md, "Building".
+      - name: 'Harden runner (audit)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c  # v2.23.0
+        with:
+          egress-policy: 'audit'
+
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Install uv'
+        # yamllint disable-line rule:line-length
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          version: '0.13.4'
+          enable-cache: false
+
+      # The one step that holds a token, and it runs no sandbox: it
+      # reads public configurations and writes a plan.
+      - name: 'Plan'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Plan
+          set -euo pipefail
+          uv run --locked python -m hookbundles fetch \
+            --out "${RUNNER_TEMP}/configs.jsonl"
+          {
+            echo '### Plan'
+            echo
+            echo '```text'
+            uv run --locked python -m hookbundles plan \
+              --configs "${RUNNER_TEMP}/configs.jsonl" \
+              --out "${RUNNER_TEMP}/plan.json"
+            echo '```'
+          } | tee -a "${GITHUB_STEP_SUMMARY}"
+
+      - name: 'Build in the sandbox'
+        shell: bash
+        run: |
+          # Build in the sandbox
+          set -euo pipefail
+          uv run --locked python -m hookbundles build \
+            --plan "${RUNNER_TEMP}/plan.json" --work "${RUNNER_TEMP}/work"
+
+      - name: 'Assemble'
+        shell: bash
+        run: |
+          # Assemble
+          set -euo pipefail
+          uv run --locked python -m hookbundles assemble \
+            --plan "${RUNNER_TEMP}/plan.json" --work "${RUNNER_TEMP}/work" \
+            --out "${RUNNER_TEMP}/bundle" | tee -a "${GITHUB_STEP_SUMMARY}"
+
+      - name: 'Upload the index'
+        # yamllint disable-line rule:line-length
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: 'hook-bundle-index'
+          path: '${{ runner.temp }}/bundle/index.json'
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: 'Upload the blobs'
+        # yamllint disable-line rule:line-length
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: 'hook-bundle-blobs'
+          path: '${{ runner.temp }}/bundle/blobs/'
+          # The blobs are compressed already.
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: 'Upload the build record'
+        if: always()
+        # yamllint disable-line rule:line-length
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: 'build-record'
+          path: |
+            ${{ runner.temp }}/plan.json
+            ${{ runner.temp }}/work/build.json
+            ${{ runner.temp }}/work/units/*.log
+          retention-days: 7
+
+  verify:
+    name: 'Lint ${{ matrix.mode }}'
+    needs: build
+    runs-on: 'ubuntu-24.04'
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: ['cold', 'warm']
+    steps:
+      # Audit: the cold leg builds every hook environment from the
+      # registries, as a lint job without a bundle does.
+      - name: 'Harden runner (audit)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c  # v2.23.0
+        with:
+          egress-policy: 'audit'
+
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Install uv'
+        # yamllint disable-line rule:line-length
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          version: '0.13.4'
+          enable-cache: false
+
+      - name: 'Download the index'
+        # yamllint disable-line rule:line-length
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: 'hook-bundle-index'
+          path: '${{ runner.temp }}/bundle'
+
+      - name: 'Download the blobs'
+        if: matrix.mode == 'warm'
+        # yamllint disable-line rule:line-length
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: 'hook-bundle-blobs'
+          path: '${{ runner.temp }}/bundle/blobs'
+
+      - name: 'Install the bundle'
+        if: matrix.mode == 'warm'
+        shell: bash
+        run: |
+          # Install the bundle
+          set -euo pipefail
+          bundle="${RUNNER_TEMP}/bundle"
+          version="$(jq -r '.prek.version' "${bundle}/index.json")"
+          uv run --locked python -m hookbundles select \
+            --index "${bundle}/index.json" > "${RUNNER_TEMP}/blobs.txt"
+          # The installer is what a lint job would run: the runner's
+          # own Python, and nothing installed for it.
+          python3 -m hookbundles install --index "${bundle}/index.json" \
+            --blobs "${bundle}/blobs" --prek-version "${version}" \
+            < "${RUNNER_TEMP}/blobs.txt" | tee "${RUNNER_TEMP}/install.json"
+
+      - name: 'Lint this repository'
+        shell: bash
+        env:
+          MODE: ${{ matrix.mode }}
+        run: |
+          # Lint this repository
+          set -euo pipefail
+          export PREK_HOME="${HOME}/.cache/prek"
+          result="${RUNNER_TEMP}/result"
+          mkdir -p "${result}" "${PREK_HOME}/hooks"
+          version="$(jq -r '.prek.version' "${RUNNER_TEMP}/bundle/index.json")"
+          prek=(uvx --no-config "prek@${version}")
+          # Fetch prek itself before the clock starts, in both legs.
+          "${prek[@]}" --version
+          # A hook that refuses to run on a branch has no place here.
+          git checkout --quiet -b verify
+          before="$(find "${PREK_HOME}/hooks" -mindepth 1 -maxdepth 1 | wc -l)"
+          started="$(date +%s.%N)"
+          status=0
+          SKIP=no-commit-to-branch "${prek[@]}" run --all-files \
+            --color never > "${result}/output.txt" 2>&1 || status=$?
+          finished="$(date +%s.%N)"
+          after="$(find "${PREK_HOME}/hooks" -mindepth 1 -maxdepth 1 | wc -l)"
+          cat "${result}/output.txt"
+          # One line a hook: its name and how it ended.
+          grep -E '(Passed|Failed|Skipped)$' "${result}/output.txt" |
+            sed -E 's/\.{3,}/ => /' | sort > "${result}/outcome.txt"
+          install='null'
+          if [ -f "${RUNNER_TEMP}/install.json" ]; then
+            install="$(cat "${RUNNER_TEMP}/install.json")"
+          fi
+          jq -n --arg mode "${MODE}" --argjson status "${status}" \
+            --argjson before "${before}" --argjson after "${after}" \
+            --argjson started "${started}" --argjson finished "${finished}" \
+            --argjson install "${install}" \
+            '{mode: $mode, status: $status, before: $before, after: $after,
+              seconds: ($finished - $started), install: $install}' \
+            > "${result}/timing.json"
+          cat "${result}/timing.json"
+
+      - name: 'Upload the result'
+        # yamllint disable-line rule:line-length
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: 'result-${{ matrix.mode }}'
+          path: '${{ runner.temp }}/result/'
+          if-no-files-found: error
+          retention-days: 7
+
+  report:
+    name: 'Compare cold and warm'
+    needs: verify
+    runs-on: 'ubuntu-24.04'
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@65ff87957e1cac2de3203a85dbb07c31810321cb  # v0.16.4
+        with:
+          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22'  # v0.17.1
+
+      - name: 'Harden runner (block)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c  # v2.23.0
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: 'Download the results'
+        # yamllint disable-line rule:line-length
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          pattern: 'result-*'
+          path: '${{ runner.temp }}/results'
+
+      - name: 'Compare'
+        shell: bash
+        working-directory: '${{ runner.temp }}/results'
+        run: |
+          # Compare
+          set -euo pipefail
+          field() { jq -r "$2" "result-$1/timing.json"; }
+          {
+            echo '### Cold and warm lint of this repository'
+            echo
+            echo '| | Cold | Warm |'
+            echo '| --- | ---: | ---: |'
+            echo "| Install the bundle (s) |" \
+              "| $(field warm '.install.seconds') |"
+            echo "| prek run (s) | $(field cold '.seconds | floor')" \
+              "| $(field warm '.seconds | floor') |"
+            echo "| Environments before | $(field cold .before)" \
+              "| $(field warm .before) |"
+            echo "| Environments after | $(field cold .after)" \
+              "| $(field warm .after) |"
+            echo "| prek exit status | $(field cold .status)" \
+              "| $(field warm .status) |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+          failed=0
+          if ! diff -u result-cold/outcome.txt result-warm/outcome.txt; then
+            echo '::error::The warm run did not report what the cold run did ❌'
+            failed=1
+          fi
+          if [ ! -s result-warm/outcome.txt ]; then
+            echo '::error::The warm run reported no hook at all ❌'
+            failed=1
+          fi
+          if [ "$(field warm .before)" != "$(field warm .after)" ]; then
+            echo '::error::The warm run built an environment itself ❌'
+            failed=1
+          fi
+          if [ "${failed}" -eq 0 ]; then
+            echo 'Same result for every hook, and nothing built warm ✅' |
+              tee -a "${GITHUB_STEP_SUMMARY}"
+          fi
+          exit "${failed}"

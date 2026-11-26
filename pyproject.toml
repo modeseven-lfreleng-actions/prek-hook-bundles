@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# Tool configuration only: this repository is not a Python package. The
+# builder under hookbundles/ runs from a checkout, as
+# `uv run --locked python -m hookbundles <command>`.
+#
+# PyYAML is the builder's one dependency, used by the planner alone to
+# read the organisation's .pre-commit-config.yaml files. The installer
+# a lint job runs (hookbundles/install.py) needs the standard library
+# and nothing else, so it works with whatever Python the runner has.
+# uv.lock fixes PyYAML by hash, and Dependabot proposes its bumps.
+[project]
+name = "prek-hook-bundles"
+version = "0"
+requires-python = ">=3.12"
+dependencies = ["pyyaml==6.0.2"]
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+files = ["hookbundles", "tests"]
