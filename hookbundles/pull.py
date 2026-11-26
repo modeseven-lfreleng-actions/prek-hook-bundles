@@ -21,6 +21,7 @@ digest that the verified index names.
 from __future__ import annotations
 
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -40,6 +41,11 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 _MAX_INDEX_BYTES = 8 * 1024 * 1024
+
+# Blobs fetched at once. A job's selection is a few dozen blobs, most
+# of them small, and one at a time the fetch took longer than the
+# install it feeds.
+_DOWNLOADS = 8
 
 
 class Unverified(Exception):
@@ -154,9 +160,15 @@ def pull(
     sizes = selection.sizes(index)
     blobs = request.work / "blobs"
     blobs.mkdir(exist_ok=True)
-    for name in chosen.blobs:
+
+    def fetch(name: str) -> None:
         digest = "sha256:" + name.split(".", 1)[0]
         registry.download(digest, blobs / name, sizes.get(name, 0))
+
+    # The registry client is read-only by now: layers() above did the
+    # one login it will do. list() raises the first failure, if any.
+    with ThreadPoolExecutor(max_workers=_DOWNLOADS) as pool:
+        _ = list(pool.map(fetch, chosen.blobs))
     report = install.install(index, blobs, chosen.blobs, runner)
     return {
         **report,

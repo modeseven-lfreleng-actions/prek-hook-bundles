@@ -508,9 +508,10 @@ jobs:
             echo "\`${name}:${TAG}\`, ${#files[@]} files."
           } >> "${GITHUB_STEP_SUMMARY}"
 
-      # Lint jobs in other repositories pull without a token. A new
-      # package starts private, and only its settings page can change
-      # that, so say so until somebody has.
+      # Lint jobs in other repositories pull without a token. The
+      # organisation's settings decide whether a new package is
+      # public, and only the package's settings page changes one that
+      # is not, so check on every run and say so.
       - name: 'Check that the bundle is public'
         shell: bash
         env:
@@ -544,7 +545,7 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
-      packages: read  # Pull the bundle while its package is private
+      packages: read  # Pull the bundle should its package be private
     steps:
       # Audit: prek itself still comes from PyPI.
       - name: 'Harden runner (audit)'

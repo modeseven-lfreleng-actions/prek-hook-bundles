@@ -230,10 +230,12 @@ tag.
 GHCR won over release assets for two reasons. Pushing needs
 `packages: write`, which reaches nothing but the package, where a
 release needs `contents: write`. And a registry addresses a blob by
-its digest, which is the name the index already gives it. The cost is
-one manual step: a new package starts private, and its settings page
-is the one place that changes that. The publish job warns on every run
-until a pull without a token succeeds.
+its digest, which is the name the index already gives it. One step
+may fall to a person: the organisation's settings decide whether a new
+package is public, and the package's settings page is the one place
+that changes a private one. The publish job tries a pull without a
+token on every run, and warns when it fails. In the fork where this
+was first run, the package was public from its first push.
 
 The registry is transport. The lint job believes nothing it serves:
 the index must carry a valid attestation, and a blob must hash to the
@@ -398,8 +400,9 @@ Those may matter more than the seconds.
   sandbox image, and its tag says which. The reusable linting
   workflow's default has to move with it; a job on another release
   finds no tag and builds cold.
-- **Package visibility.** After the first publish, an organisation
-  owner has to make the `prek-hook-bundles` package public, once.
+- **Package visibility.** If the publish job warns that the package is
+  not public, an organisation owner has to change that, once, in the
+  package's settings.
 - **Runner image.** `bundle.toml` names the image family and
   `sandbox/Dockerfile` must be the same distribution release, so that
   an environment's compiled parts find the C library of their build.
