@@ -1,0 +1,150 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# prek-hook-bundles
+#
+# Installs prebuilt prek hook environments into an empty prek store, so
+# that the prek a lint job runs next finds them and builds nothing.
+# Call it before the hooks run, on the runner that will run them.
+#
+# It fetches the bundle published for the runner's image, architecture
+# and prek release, verifies that this repository's build workflow
+# attested it, downloads the blobs the job's hooks need, and installs
+# them. See docs/DESIGN.md.
+#
+# It never fails a lint job that could have run without it. Whatever
+# goes wrong, the store is left as it was found and prek builds the
+# environments itself; 'status' says what happened. Set 'required' to
+# make anything short of an installed bundle fatal.
+#
+# Security posture:
+#   * The publisher is the repository this action was loaded from, on
+#     its default branch, and nothing the caller passes can change
+#     that. An index any other workflow or branch signed is refused.
+#   * Nothing from the registry is used before the index is verified,
+#     and a blob is fetched only by a digest the verified index names.
+#   * The installer runs as 'python3 -I', with the working directory,
+#     which is the checkout being linted, off the import path, and
+#     with a PATH of system directories, so the checkout cannot supply
+#     the python3, gh or zstd it runs.
+#   * All inputs reach the shell through 'env'.
+name: '📦 prek hook bundle'
+description: 'Installs prebuilt, verified prek hook environments for a lint job'
+
+inputs:
+  prek_version:
+    description: >-
+      The prek release the job will run (X.Y.Z). A bundle serves one
+      release, so this selects the bundle; a job running any other
+      release must not be given its environments.
+    required: true
+  config_path:
+    description: 'The hook configuration the job will run'
+    required: false
+    default: '.pre-commit-config.yaml'
+  hooks:
+    description: >-
+      Space or comma separated ids of the hooks the job will run.
+      Empty installs what every hook in the configuration needs.
+    required: false
+    default: ''
+  registry:
+    description: >-
+      Registry path of the bundle, as 'host/name'. Empty takes the
+      GitHub Container Registry package of the repository this action
+      was loaded from.
+    required: false
+    default: ''
+  registry_token:
+    description: >-
+      Token for a bundle whose package is private. A published bundle
+      is public and needs none.
+    required: false
+    default: ''
+  required:
+    description: >-
+      Set 'true' to fail unless a bundle was installed. The default
+      carries on without one.
+    required: false
+    default: 'false'
+
+outputs:
+  status:
+    description: >-
+      'installed'; 'not-applicable' when no bundle serves this runner
+      and prek release; 'unverified' when the bundle failed
+      verification; 'failed' when it could not be fetched or written.
+    value: ${{ steps.bundle.outputs.status }}
+  report:
+    description: 'When installed, a JSON object of what was fetched'
+    value: ${{ steps.bundle.outputs.report }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: 'Install prek hook bundle'
+      id: bundle
+      shell: bash
+      env:
+        INPUT_PREK_VERSION: ${{ inputs.prek_version }}
+        INPUT_CONFIG_PATH: ${{ inputs.config_path }}
+        INPUT_HOOKS: ${{ inputs.hooks }}
+        INPUT_REGISTRY: ${{ inputs.registry }}
+        INPUT_REQUIRED: ${{ inputs.required }}
+        # The repository the action's own code came from. For a local
+        # 'uses' it is empty, and the workflow's repository is the same.
+        PUBLISHER: ${{ github.action_repository || github.repository }}
+        HOOKBUNDLES_REGISTRY_PASSWORD: ${{ inputs.registry_token }}
+      run: |
+        # Install prek hook bundle
+        set -uo pipefail
+        if ! [[ "${INPUT_PREK_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          echo '::error::prek_version must be a release, as X.Y.Z ❌'
+          exit 1
+        fi
+        case "${INPUT_REQUIRED}" in
+          true|false) ;;
+          *)
+            echo "::error::required must be 'true' or 'false' ❌"
+            exit 1
+            ;;
+        esac
+        registry="${INPUT_REGISTRY:-ghcr.io/${PUBLISHER,,}}"
+        work="$(mktemp -d "${RUNNER_TEMP}/prek-hook-bundle.XXXXXX")"
+        code=0
+        report="$(PATH=/usr/bin:/bin /usr/bin/python3 -I \
+          "${GITHUB_ACTION_PATH}/cli.py" pull \
+          --registry "${registry}" --publisher "${PUBLISHER}" \
+          --prek-version "${INPUT_PREK_VERSION}" \
+          --hook-config "${INPUT_CONFIG_PATH}" --hooks "${INPUT_HOOKS}" \
+          --prek-home "${HOME}/.cache/prek" --work "${work}")" || code=$?
+        # The downloaded blobs are installed or useless by now.
+        rm -rf "${work}"
+        case "${code}" in
+          0)
+            status='installed'
+            echo "report=${report}" >> "${GITHUB_OUTPUT}"
+            echo "prek hook bundle installed: ${report} ✅"
+            ;;
+          3)
+            status='not-applicable'
+            echo '::notice::No prek hook bundle for this job; prek builds' \
+              'its hook environments as usual'
+            ;;
+          4)
+            status='unverified'
+            echo '::error::The prek hook bundle failed verification and' \
+              'was not installed; prek builds its hook environments ❌'
+            ;;
+          *)
+            status='failed'
+            echo '::warning::The prek hook bundle could not be installed;' \
+              'prek builds its hook environments ⚠️'
+            ;;
+        esac
+        echo "status=${status}" >> "${GITHUB_OUTPUT}"
+        if [ "${INPUT_REQUIRED}" = 'true' ] && [ "${status}" != 'installed' ]
+        then
+          exit 1
+        fi

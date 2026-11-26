@@ -26,11 +26,61 @@ model and the measurements.
 
 ## Status
 
-The builder and the installer work, and the
-[build workflow](.github/workflows/build.yaml) proves a bundle on
-fresh runners each time it runs. The workflow publishes nothing yet,
-and no lint job uses a bundle: signing, publishing and the consumer
-side are the next stages, described in the design document.
+The [build workflow](.github/workflows/build.yaml) builds a bundle,
+proves it on fresh runners, signs its index and publishes it to the
+GitHub Container Registry. This repository's action fetches, verifies
+and installs it. No lint job outside this repository calls the action
+yet; the design document lists what remains.
+
+## Using a bundle in a lint job
+
+Call the action before the hooks run, on the runner that runs them,
+with the prek release the job uses:
+
+<!-- markdownlint-disable MD013 MD046 -->
+
+```yaml
+steps:
+  - name: "Install prek hook bundle"
+    # Pin a real release SHA in place of <SHA>.
+    uses: lfreleng-actions/prek-hook-bundles@<SHA>
+    with:
+      prek_version: "0.4.14"
+```
+
+<!-- markdownlint-enable MD013 MD046 -->
+
+The action trusts bundles published from the default branch of the
+repository that supplied the action, so the commit a caller pins is
+the root of trust. It needs an empty prek store, and it never fails a job
+that could have run without it: when no bundle fits, or one fails
+verification, prek builds its environments as usual.
+
+### Inputs
+
+<!-- markdownlint-disable MD013 -->
+
+| Name           | Required | Description                                                     | Default                   |
+| -------------- | -------- | --------------------------------------------------------------- | ------------------------- |
+| prek_version   | True     | The prek release the job runs (X.Y.Z); selects the bundle       |                           |
+| config_path    | False    | The hook configuration the job runs                             | `.pre-commit-config.yaml` |
+| hooks          | False    | Space or comma separated hook ids to install for; empty for all |                           |
+| registry       | False    | Registry path of the bundle; empty for this repository's own    |                           |
+| registry_token | False    | Token for a bundle whose package is private                     |                           |
+| required       | False    | `true` fails the step unless the bundle installs                | `false`                   |
+
+<!-- markdownlint-enable MD013 -->
+
+### Outputs
+
+<!-- markdownlint-disable MD013 -->
+
+| Name   | Description                                                 |
+| ------ | ----------------------------------------------------------- |
+| status | `installed`, `not-applicable`, `unverified` or `failed`     |
+| report | After an install, a JSON object describing the fetch        |
+
+<!-- markdownlint-enable MD013 -->
 
 ## How it fits together
 
@@ -40,12 +90,14 @@ side are the next stages, described in the design document.
 | Plan     | `plan`     | Reduces them to the distinct environments in use    |
 | Build    | `build`    | Builds each one in a container of its own           |
 | Assemble | `assemble` | Checks every result; writes an index and the blobs  |
-| Select   | `select`   | Lint job: picks the blobs its configuration needs   |
-| Install  | `install`  | Lint job: writes those blobs into an empty store    |
+| Pull     | `pull`     | Lint job: fetches, verifies and installs a bundle   |
 
 [`bundle.toml`](bundle.toml) names the organisation to survey, the
-number of repositories that must share an environment before the
+numbers of repositories that must share an environment before the
 builder includes it, and the toolchain versions to build against.
+
+`select` and `install` are the two halves of `pull` after the fetch,
+for a bundle that is already on disk.
 
 ## Running it locally
 

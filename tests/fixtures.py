@@ -10,7 +10,8 @@ import json
 import tarfile
 from typing import TYPE_CHECKING, final
 
-from hookbundles.plan import Unit
+from hookbundles import assemble
+from hookbundles.plan import Plan, Unit
 from hookbundles.settings import Settings
 
 if TYPE_CHECKING:
@@ -173,3 +174,27 @@ def built(*units: Unit) -> dict[str, object]:
         "arch": "x86_64",
         "units": {item.uid: {"status": "built"} for item in units},
     }
+
+
+def bundle(root: Path) -> tuple[dict[str, object], Path, Path]:
+    """Assemble a bundle of one seed and one ruff environment under root.
+
+    Return its index, its blobs directory, and the empty store it was
+    built for, which is inside root so that a test can install into it.
+    """
+    home = root / "store"
+    work = root / "work"
+    base(work, str(home))
+    item = unit()
+    tar = Tar(work / "units" / f"{item.uid}.tar").directory("hooks")
+    content = marker(ENV_DIR, home=str(home))
+    _ = environment(tar, ENV_DIR, content, str(home)).close()
+    blobs = root / "out" / "blobs"
+    index = assemble.assemble(
+        settings(str(home)),
+        Plan(units=(item,), notes=(), surveyed=0),
+        built(item),
+        work,
+        assemble.Writer(blobs, str(home), 0),
+    )
+    return index, blobs, home

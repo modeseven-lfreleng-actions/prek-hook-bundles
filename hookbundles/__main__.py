@@ -11,15 +11,19 @@ a stage can be rerun or inspected on its own:
   build     plan, in the sandbox               -> <work>/
   assemble  what the sandbox produced          -> index.json, blobs/
 
-and a lint job runs two:
+and a lint job runs one, or its two halves when it already has the
+bundle on disk:
 
-  select    the blobs its configuration needs
+  pull      fetch a published bundle, verify it, and install what the
+            job's hooks need
+  select    the blobs a configuration needs
   install   those blobs into an empty prek store
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import os
 import platform
@@ -32,15 +36,26 @@ from typing import TYPE_CHECKING, cast
 from hookbundles import assemble as assembly
 from hookbundles import install as installer
 from hookbundles import plan as planner
-from hookbundles import sandbox, selection, settings, values
+from hookbundles import pull as puller
+from hookbundles import registry, sandbox, selection, settings, values
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-# Exit status of 'install' when the bundle is sound but was built for
-# a different runner, prek or store location. The caller carries on
-# without it.
+# Exit status of 'install' and 'pull' when the bundle is sound but was
+# built for a different runner, prek or store location, or none is
+# published. The caller carries on without it.
 NOT_APPLICABLE = 3
+
+# Exit status of 'pull' when the index fails verification. Nothing was
+# installed. The caller should carry on without a bundle too, and say
+# so where a person will see it.
+UNVERIFIED = 4
+
+# The environment variable holding a registry token, for a bundle whose
+# package is still private. Never a command-line option: those show in
+# the process list.
+PASSWORD_VARIABLE = "HOOKBUNDLES_REGISTRY_PASSWORD"  # noqa: S105 - a name
 
 
 class UsageError(Exception):
@@ -221,17 +236,31 @@ def _assemble(arguments: Arguments) -> int:
         "commit": os.environ.get("GITHUB_SHA", ""),
         "run": os.environ.get("GITHUB_RUN_ID", ""),
     }
+    now = datetime.datetime.now(datetime.UTC)
+    index["built"] = now.isoformat(timespec="seconds")
     _ = (out / "index.json").write_text(json.dumps(index, indent=2) + "\n")
     print(_summary(index))
     return 0
+
+
+def _runner(arguments: Arguments) -> installer.Runner:
+    return installer.Runner(
+        home=arguments.path("prek_home").absolute(),
+        arch=arguments.text("arch"),
+        image_os=arguments.text("image_os"),
+        prek_version=arguments.text("prek_version"),
+    )
+
+
+def _hooks(arguments: Arguments) -> set[str] | None:
+    return set(arguments.text("hooks").replace(",", " ").split()) or None
 
 
 def _select(arguments: Arguments) -> int:
     """Print the blobs a configuration's hooks need, one a line."""
     index = _read_json(arguments.path("index"))
     config = planner.load_yaml(arguments.path("hook_config").read_text())
-    hooks = set(arguments.text("hooks").replace(",", " ").split()) or None
-    chosen = selection.select(index, config, hooks)
+    chosen = selection.select(index, config, _hooks(arguments))
     served = chosen.wanted - len(chosen.missing)
     summary = [
         f"The bundle has {chosen.environments} environments"
@@ -245,18 +274,12 @@ def _select(arguments: Arguments) -> int:
 
 def _install(arguments: Arguments) -> int:
     """Install the blobs named on standard input into the prek store."""
-    runner = installer.Runner(
-        home=arguments.path("prek_home").absolute(),
-        arch=arguments.text("arch"),
-        image_os=arguments.text("image_os"),
-        prek_version=arguments.text("prek_version"),
-    )
     try:
         report = installer.install(
             _read_json(arguments.path("index")),
             arguments.path("blobs"),
             sys.stdin.read().split(),
-            runner,
+            _runner(arguments),
         )
     except installer.NotApplicable as error:
         print(f"Bundle not used: {error}", file=sys.stderr)
@@ -268,11 +291,49 @@ def _install(arguments: Arguments) -> int:
     return 0
 
 
+def _pull(arguments: Arguments) -> int:
+    """Fetch a published bundle, verify it, and install what is needed."""
+    repository = arguments.text("registry")
+    publisher = puller.Publisher(
+        repository=arguments.text("publisher") or repository.partition("/")[2],
+        workflow=arguments.text("publisher_workflow"),
+        ref=arguments.text("publisher_ref"),
+    )
+    try:
+        config = planner.load_yaml(arguments.path("hook_config").read_text())
+    except Exception as error:  # noqa: BLE001 - no file, no parser or bad YAML
+        reason = f"cannot read the hook configuration ({type(error).__name__})"
+        print(f"Bundle not used: {reason}", file=sys.stderr)
+        return NOT_APPLICABLE
+    request = puller.Request(
+        repository=repository,
+        publisher=publisher,
+        config=config,
+        hooks=_hooks(arguments),
+        work=arguments.path("work"),
+        password=os.environ.get(PASSWORD_VARIABLE, ""),
+    )
+    try:
+        report = puller.pull(request, _runner(arguments))
+    except installer.NotApplicable as error:
+        print(f"Bundle not used: {error}", file=sys.stderr)
+        return NOT_APPLICABLE
+    except puller.Unverified as error:
+        print(f"Bundle not verified: {error}", file=sys.stderr)
+        return UNVERIFIED
+    except (registry.RegistryError, installer.InstallError, ValueError) as error:
+        print(f"Bundle refused: {error}", file=sys.stderr)
+        return 1
+    print(json.dumps(report))
+    return 0
+
+
 _COMMANDS: dict[str, Callable[[Arguments], int]] = {
     "fetch": _fetch,
     "plan": _plan,
     "build": _build,
     "assemble": _assemble,
+    "pull": _pull,
     "select": _select,
     "install": _install,
 }
@@ -281,6 +342,16 @@ _COMMANDS: dict[str, Callable[[Arguments], int]] = {
 # makes the option required.
 _Option = tuple[str, type[Path] | type[str] | type[int] | type[float], object]
 _CONFIG: _Option = ("--config", Path, Path("bundle.toml"))
+_HOOK_CONFIG: _Option = ("--hook-config", Path, Path(".pre-commit-config.yaml"))
+_RUNNER: tuple[_Option, ...] = (
+    (
+        "--prek-home",
+        Path,
+        Path(os.environ.get("PREK_HOME") or Path.home() / ".cache" / "prek"),
+    ),
+    ("--arch", str, platform.machine()),
+    ("--image-os", str, os.environ.get("ImageOS", "")),
+)
 _OPTIONS: dict[str, tuple[_Option, ...]] = {
     "fetch": (_CONFIG, ("--out", Path, None)),
     "plan": (_CONFIG, ("--configs", Path, None), ("--out", Path, None)),
@@ -299,22 +370,25 @@ _OPTIONS: dict[str, tuple[_Option, ...]] = {
         ("--out", Path, None),
         ("--level", int, 19),
     ),
-    "select": (
-        ("--index", Path, None),
-        ("--hook-config", Path, Path(".pre-commit-config.yaml")),
+    "pull": (
+        ("--registry", str, None),
+        # Empty takes the registry path's 'owner/name', which is what
+        # GHCR gives a package published from a repository's workflow.
+        ("--publisher", str, ""),
+        ("--publisher-workflow", str, ".github/workflows/build.yaml"),
+        ("--publisher-ref", str, "refs/heads/main"),
+        ("--prek-version", str, None),
+        ("--work", Path, None),
+        _HOOK_CONFIG,
         ("--hooks", str, ""),
+        *_RUNNER,
     ),
+    "select": (("--index", Path, None), _HOOK_CONFIG, ("--hooks", str, "")),
     "install": (
         ("--index", Path, None),
         ("--blobs", Path, None),
-        (
-            "--prek-home",
-            Path,
-            Path(os.environ.get("PREK_HOME") or Path.home() / ".cache" / "prek"),
-        ),
-        ("--arch", str, platform.machine()),
-        ("--image-os", str, os.environ.get("ImageOS", "")),
         ("--prek-version", str, ""),
+        *_RUNNER,
     ),
 }
 

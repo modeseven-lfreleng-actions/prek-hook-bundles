@@ -98,12 +98,24 @@ def select(
     )
 
 
-def everything(index: dict[str, object]) -> tuple[str, ...]:
-    """Return every blob the index names."""
+def _all_entries(index: dict[str, object]) -> list[dict[str, object]]:
     tools = values.mapping(index.get("tools")) or {}
-    entries = [
+    return [
         *(tool for item in tools.values() if (tool := values.mapping(item))),
         *_entries(index, "clones"),
         *_entries(index, "environments"),
     ]
-    return tuple(dict.fromkeys(name for entry in entries if (name := _blob(entry))))
+
+
+def everything(index: dict[str, object]) -> tuple[str, ...]:
+    """Return every blob the index names."""
+    names = (_blob(entry) for entry in _all_entries(index))
+    return tuple(dict.fromkeys(name for name in names if name))
+
+
+def sizes(index: dict[str, object]) -> dict[str, int]:
+    """Return the download size the index records for each blob."""
+    return {
+        _blob(entry): values.integer(entry.get("size")) or 0
+        for entry in _all_entries(index)
+    }

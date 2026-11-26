@@ -2,13 +2,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 The Linux Foundation
 
-# Builds the bundle of prek hook environments, then proves it on fresh
-# runners: one lints this repository with an empty prek store, one with
-# the bundle installed, and the two must report the same result for
-# every hook while the second builds no environment at all.
+# Builds the bundle of prek hook environments, proves it on fresh
+# runners, and then publishes it.
 #
-# See docs/DESIGN.md. This workflow does not publish anything yet: the
-# bundle is a run artifact, which is all the verification needs.
+# The proof: one job lints this repository with an empty prek store,
+# one with the bundle installed, and the two must report the same
+# result for every hook while the second builds no environment at all.
+#
+# Publishing happens on the default branch alone, and after the proof.
+# The publish job signs the bundle's index and pushes the bundle to the
+# GitHub Container Registry; a last job then fetches it back through
+# this repository's action, as a lint job elsewhere would.
+#
+# See docs/DESIGN.md.
 name: 'Build hook bundle 📦'
 
 # yamllint disable-line rule:truthy
@@ -18,6 +24,10 @@ on:
     branches: ['main']
   pull_request:
     branches: ['main']
+  # Daily, so a hook revision the estate moves to reaches the bundle
+  # within a day, and unpinned dependencies do not go stale.
+  schedule:
+    - cron: '17 4 * * *'
 
 concurrency:
   group: 'build-${{ github.ref }}'
@@ -28,6 +38,10 @@ permissions: {}
 jobs:
   test:
     name: 'Unit tests'
+    # A fork has no use for a daily build, and would publish one.
+    # Every other job needs this one or 'build', so they follow.
+    # yamllint disable-line rule:line-length
+    if: github.event_name != 'schedule' || github.repository == 'lfreleng-actions/prek-hook-bundles'
     runs-on: 'ubuntu-24.04'
     timeout-minutes: 10
     permissions:
@@ -71,10 +85,18 @@ jobs:
 
   build:
     name: 'Build bundle'
+    # yamllint disable-line rule:line-length
+    if: github.event_name != 'schedule' || github.repository == 'lfreleng-actions/prek-hook-bundles'
     runs-on: 'ubuntu-24.04'
     timeout-minutes: 45
     permissions:
       contents: read
+    outputs:
+      # The publish job fetches the bundle by these ids, not by name:
+      # a later job that replaced an artifact would give it a new id.
+      index_artifact: ${{ steps.index.outputs.artifact-id }}
+      blobs_artifact: ${{ steps.blobs.outputs.artifact-id }}
+      prek: ${{ steps.assemble.outputs.prek }}
     steps:
       # Audit, not block: the sandbox installs whatever the planned
       # hooks' packaging asks for, from registries no list can name in
@@ -129,6 +151,7 @@ jobs:
             --plan "${RUNNER_TEMP}/plan.json" --work "${RUNNER_TEMP}/work"
 
       - name: 'Assemble'
+        id: assemble
         shell: bash
         run: |
           # Assemble
@@ -136,8 +159,11 @@ jobs:
           uv run --locked python -m hookbundles assemble \
             --plan "${RUNNER_TEMP}/plan.json" --work "${RUNNER_TEMP}/work" \
             --out "${RUNNER_TEMP}/bundle" | tee -a "${GITHUB_STEP_SUMMARY}"
+          prek="$(jq -r '.prek.version' "${RUNNER_TEMP}/bundle/index.json")"
+          echo "prek=${prek}" >> "${GITHUB_OUTPUT}"
 
       - name: 'Upload the index'
+        id: index
         # yamllint disable-line rule:line-length
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
@@ -147,6 +173,7 @@ jobs:
           retention-days: 7
 
       - name: 'Upload the blobs'
+        id: blobs
         # yamllint disable-line rule:line-length
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
@@ -350,3 +377,234 @@ jobs:
               tee -a "${GITHUB_STEP_SUMMARY}"
           fi
           exit "${failed}"
+
+  publish:
+    name: 'Publish bundle'
+    # After the proof, and from the default branch alone. Lint jobs
+    # accept an index this workflow signed on that branch and no other,
+    # so a bundle published from anywhere else would be refused, and
+    # would have replaced one that was not.
+    needs: [test, build, report]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: 'ubuntu-24.04'
+    timeout-minutes: 20
+    permissions:
+      packages: write      # Push the bundle to the registry
+      id-token: write      # Sign the attestation over its index
+      attestations: write  # Record the attestation
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+    steps:
+      # This job holds the only write permissions in the workflow, so
+      # it checks out nothing and runs none of this repository's code:
+      # pinned actions, and the shell below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@65ff87957e1cac2de3203a85dbb07c31810321cb  # v0.16.4
+        with:
+          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22'  # v0.17.1
+
+      - name: 'Harden runner (block)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c  # v2.23.0
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      # By id: the lint jobs that ran since the build executed hook
+      # code on their runners, and an artifact they replaced under the
+      # same name would carry a different id.
+      - name: 'Download the index'
+        # yamllint disable-line rule:line-length
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          artifact-ids: ${{ needs.build.outputs.index_artifact }}
+          merge-multiple: true
+          path: '${{ runner.temp }}/bundle'
+
+      - name: 'Download the blobs'
+        # yamllint disable-line rule:line-length
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          artifact-ids: ${{ needs.build.outputs.blobs_artifact }}
+          merge-multiple: true
+          path: '${{ runner.temp }}/bundle/blobs'
+
+      - name: 'Check the blobs against the index'
+        id: check
+        shell: bash
+        working-directory: '${{ runner.temp }}/bundle'
+        run: |
+          # Check the blobs against the index
+          set -euo pipefail
+          expected="${RUNNER_TEMP}/expected.txt"
+          present="${RUNNER_TEMP}/present.txt"
+          jq -r '[.tools[].blob, .clones[].blob, .environments[].blob]
+            | unique | .[]' index.json > "${expected}"
+          find blobs -mindepth 1 -printf '%f\n' | sort > "${present}"
+          if ! diff "${expected}" "${present}"; then
+            echo '::error::The blobs are not the ones the index names ❌'
+            exit 1
+          fi
+          # A blob's name is the SHA-256 of its content.
+          sed -E 's#^([0-9a-f]{64})(\..*)$#\1  blobs/\1\2#' "${expected}" |
+            sha256sum --check --quiet --strict
+          tag="$(jq -r '[.platform.image_os, .platform.arch,
+            "prek" + .prek.version] | join("-")' index.json)"
+          if ! [[ "${tag}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+            echo '::error::The index does not yield a usable tag ❌'
+            exit 1
+          fi
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "Blobs match the index; publishing as ${tag} ✅"
+
+      - name: 'Attest the index'
+        id: attest
+        # yamllint disable-line rule:line-length
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-path: '${{ runner.temp }}/bundle/index.json'
+
+      - name: 'Install ORAS'
+        # yamllint disable-line rule:line-length
+        uses: oras-project/setup-oras@ac735097e22fe643015b0d19645f7c9a69942128  # v2.0.4
+        with:
+          version: '1.4.0'
+
+      - name: 'Push the bundle'
+        shell: bash
+        working-directory: '${{ runner.temp }}/bundle'
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ steps.check.outputs.tag }}
+          ATTESTATION: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          # Push the bundle
+          set -euo pipefail
+          # The attestation travels with the bundle, so a lint job can
+          # verify the index without a GitHub API call or a token.
+          cp "${ATTESTATION}" attestation.jsonl
+          name="ghcr.io/${REPOSITORY,,}"
+          prefix='application/vnd.lfreleng.prek-hook-bundle'
+          files=(
+            "index.json:${prefix}.index.v1+json"
+            'attestation.jsonl:application/vnd.dev.sigstore.bundle.v0.3+json'
+          )
+          while read -r blob; do
+            files+=("blobs/${blob}:${prefix}.blob.v1.tar+zstd")
+          done < "${RUNNER_TEMP}/expected.txt"
+          oras login ghcr.io --username "${ACTOR}" --password-stdin \
+            <<< "${REGISTRY_TOKEN}"
+          source="https://github.com/${REPOSITORY}"
+          oras push "${name}:${TAG}" --artifact-type "${prefix}.v1" \
+            --annotation "org.opencontainers.image.source=${source}" \
+            "${files[@]}"
+          oras logout ghcr.io
+          {
+            echo '### Published'
+            echo
+            echo "\`${name}:${TAG}\`, ${#files[@]} files."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      # Lint jobs in other repositories pull without a token. A new
+      # package starts private, and only its settings page can change
+      # that, so say so until somebody has.
+      - name: 'Check that the bundle is public'
+        shell: bash
+        env:
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ steps.check.outputs.tag }}
+        run: |
+          # Check that the bundle is public
+          set -uo pipefail
+          name="${REPOSITORY,,}"
+          scope="repository:${name}:pull"
+          token="$(curl --silent --fail --max-time 30 \
+            "https://ghcr.io/token?service=ghcr.io&scope=${scope}" |
+            jq -r '.token // empty')"
+          code="$(curl --silent --output /dev/null --max-time 30 \
+            --write-out '%{http_code}' \
+            --header "Authorization: Bearer ${token}" \
+            --header 'Accept: application/vnd.oci.image.manifest.v1+json' \
+            "https://ghcr.io/v2/${name}/manifests/${TAG}")"
+          if [ "${code}" = '200' ]; then
+            echo 'The bundle can be pulled without a token ✅'
+          else
+            echo "::warning::The package ghcr.io/${name} is not public, so" \
+              'lint jobs in other repositories cannot fetch the bundle.' \
+              'Change its visibility in the package settings ⚠️'
+          fi
+
+  fetch:
+    name: 'Lint from the registry'
+    needs: [build, publish]
+    runs-on: 'ubuntu-24.04'
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read  # Pull the bundle while its package is private
+    steps:
+      # Audit: prek itself still comes from PyPI.
+      - name: 'Harden runner (audit)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c  # v2.23.0
+        with:
+          egress-policy: 'audit'
+
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Install uv'
+        # yamllint disable-line rule:line-length
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          version: '0.13.4'
+          enable-cache: false
+
+      # What a lint job in any repository would do: this repository's
+      # action, fetching what was just published and verifying it.
+      - name: 'Install the published bundle'
+        id: bundle
+        uses: $/
+        with:
+          prek_version: ${{ needs.build.outputs.prek }}
+          registry_token: ${{ github.token }}
+          required: 'true'
+
+      - name: 'Lint this repository'
+        shell: bash
+        env:
+          PREK_VERSION: ${{ needs.build.outputs.prek }}
+          REPORT: ${{ steps.bundle.outputs.report }}
+        run: |
+          # Lint this repository
+          set -euo pipefail
+          export PREK_HOME="${HOME}/.cache/prek"
+          prek=(uvx --no-config "prek@${PREK_VERSION}")
+          "${prek[@]}" --version
+          git checkout --quiet -b verify
+          before="$(find "${PREK_HOME}/hooks" -mindepth 1 -maxdepth 1 | wc -l)"
+          status=0
+          SKIP=no-commit-to-branch "${prek[@]}" run --all-files \
+            --color never || status=$?
+          after="$(find "${PREK_HOME}/hooks" -mindepth 1 -maxdepth 1 | wc -l)"
+          {
+            echo '### Lint from the registry'
+            echo
+            echo '```json'
+            jq . <<< "${REPORT}"
+            echo '```'
+            echo "prek exit status ${status};" \
+              "environments ${before} before, ${after} after."
+          } >> "${GITHUB_STEP_SUMMARY}"
+          if [ "${status}" -ne 0 ] || [ "${before}" -eq 0 ] ||
+            [ "${before}" != "${after}" ]; then
+            echo '::error::The published bundle did not serve this lint ❌'
+            exit 1
+          fi
+          echo 'Linted from the published bundle, building nothing ✅'
